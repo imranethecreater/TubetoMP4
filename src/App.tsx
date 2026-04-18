@@ -18,7 +18,12 @@ export default function App() {
     e.preventDefault();
     if (!url) return;
 
-    if (!url.includes('youtube.com') && !url.includes('youtu.be')) {
+    let targetUrl = url.trim();
+    if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+      targetUrl = 'https://' + targetUrl;
+    }
+
+    if (!targetUrl.includes('youtube.com') && !targetUrl.includes('youtu.be')) {
       setError('Please enter a valid YouTube URL');
       return;
     }
@@ -27,77 +32,141 @@ export default function App() {
     setError(null);
     setDownloadUrl(null);
     setVideoInfo(null);
-    setProgressText('Initializing...');
+    setProgressText('Processing...');
     setProgressPercent(0);
 
+    const encodedUrl = encodeURIComponent(targetUrl);
+    let finalUrl: string | null = null;
+    let meta: any = null;
+
     try {
-      const formatMap: Record<string, string> = {
-        'max': '1080',
-        '1080': '1080',
-        '720': '720',
-        '480': '480',
-        '360': '360'
-      };
-      
-      const targetFormat = formatMap[quality] || '1080';
-      const encodedUrl = encodeURIComponent(url);
-      
-      const metaPromise = fetch(`/api/video-info?url=${encodedUrl}`).then(r => r.json()).catch(() => null);
-      
-      const initRes = await fetch(`/api/loader/download?format=${targetFormat}&url=${encodedUrl}`);
-      
-      if (!initRes.ok) {
-        throw new Error('Failed to initialize download. Service might be busy.');
+      // Step 1: Attempt the Backend Proxy (Loader.to / oEmbed)
+      // This works perfectly if hosted online.
+      try {
+        const baseUrl = window.location.origin === "file://" ? "https://ais-dev-ncjyemdorkxf2xeubb6lf3-204417233651.europe-west2.run.app" : "";
+        
+        // Fetch metadata via proxy
+        meta = await fetch(`${baseUrl}/api/video-info?url=${encodedUrl}`).then(r => r.json()).catch(() => null);
+
+        const formatMap: Record<string, string> = { 'max': '1080', '1080': '1080', '720': '720', '480': '480', '360': '360' };
+        const initRes = await fetch(`${baseUrl}/api/loader/download?format=${formatMap[quality] || '1080'}&url=${encodedUrl}`);
+        
+        if (initRes.ok) {
+          const initData = await initRes.json();
+          if (initData.id) {
+            let isDone = false;
+            while (!isDone) {
+              await new Promise(r => setTimeout(r, 2000));
+              const statusRes = await fetch(`${baseUrl}/api/loader/progress?id=${initData.id}`);
+              const statusData = await statusRes.json();
+              if (statusData.progress !== undefined) {
+                setProgressPercent(Math.min(100, Math.max(0, Math.round(statusData.progress / 10))));
+              }
+              if (statusData.success === 1 || statusData.download_url) {
+                finalUrl = statusData.download_url;
+                isDone = true;
+              } else if (statusData.success === 0 && statusData.text === "Error") {
+                throw new Error("Proxy extraction failed.");
+              }
+            }
+          }
+        }
+      } catch (proxyError) {
+        console.warn("Backend proxy failed, switching to offline fallback...", proxyError);
       }
-      
-      const initData = await initRes.json();
-      
-      const meta = await metaPromise;
+
+      // Step 2: Native Fallback directly from client (for APK Wrappers)
+      // If the backend failed due to lack of Node.js Server in the APK wrapper, use Cobalt which supports CORS!
+      if (!finalUrl) {
+        setProgressText('Using Client API...');
+        const cobaltInstances = [
+          'https://cobalt.kyuu.moe',
+          'https://api.cobalt.easrng.net',
+          'https://co.wuk.sh',
+          'https://api.cobalt.tools',
+          'https://cobalt.seasi.dev'
+        ];
+
+        let cobaltSuccess = false;
+        let lastCobaltError = "";
+
+        // Client fallback meta via public oEmbed endpoint if proxy failed
+        if (!meta) {
+           try {
+               const oembedRes = await fetch(`https://www.youtube.com/oembed?url=${encodedUrl}&format=json`);
+               const oembedData = await oembedRes.json();
+               let hqThumbnail = oembedData.thumbnail_url;
+               if (hqThumbnail && hqThumbnail.includes("hqdefault")) {
+                   hqThumbnail = hqThumbnail.replace("hqdefault", "maxresdefault");
+               }
+               meta = { title: oembedData.title, image: hqThumbnail, description: oembedData.author_name };
+           } catch(e) {
+               // Ignore oEmbed fetch failures
+           }
+        }
+
+        for (const instance of cobaltInstances) {
+          try {
+            const res = await fetch(`${instance}/api/json`, {
+              method: 'POST',
+              headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: targetUrl, videoQuality: quality === 'max' ? '1080' : quality, isAudioOnly: false })
+            });
+
+            if (!res.ok) throw new Error("Instance busy");
+            const data = await res.json();
+            
+            if (data.status === "redirect" || data.status === "stream") {
+               finalUrl = data.url;
+               cobaltSuccess = true;
+               break;
+            } else if (data.status === "error") {
+               lastCobaltError = data.text || "Unknown API Error";
+            }
+          } catch(e: any) {
+             lastCobaltError = e.message;
+          }
+        }
+
+        if (!cobaltSuccess && !finalUrl) {
+           throw new Error(lastCobaltError || "All servers are busy. Please try again soon.");
+        }
+      }
+
       if (meta && !meta.error) {
-         setVideoInfo(meta);
+        setVideoInfo(meta);
       }
       
-      if (!initData.id) {
-        throw new Error('Failed to start download process.');
-      }
-
-      const jobId = initData.id;
-      let isDone = false;
-      let finalUrl = null;
-
-      while (!isDone) {
-        await new Promise(r => setTimeout(r, 2000));
-        
-        const statusRes = await fetch(`/api/loader/progress?id=${jobId}`);
-        const statusData = await statusRes.json();
-        
-        setProgressText(statusData.text || 'Processing...');
-        
-        if (statusData.progress !== undefined) {
-          setProgressPercent(Math.min(100, Math.max(0, Math.round(statusData.progress / 10))));
-        }
-
-        if (statusData.success === 1 || statusData.download_url) {
-          finalUrl = statusData.download_url;
-          isDone = true;
-        } else if (statusData.success === 0 && statusData.text === "Error") {
-          throw new Error('Service returned an error during extraction. The video may be restricted.');
-        }
-      }
-
       if (finalUrl) {
         setDownloadUrl(finalUrl);
-      } else {
-        throw new Error('Failed to retrieve final download link.');
       }
 
     } catch (err: any) {
-      console.error(err);
-      setError(err.message || 'Failed to process video. Please try again.');
+      console.error("Master processing error: ", err);
+      setError(err.message || 'Failed to process video. Please check your network connection.');
     } finally {
       setLoading(false);
       setProgressText('');
       setProgressPercent(0);
+    }
+  };
+
+  const handleDownloadClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    // For native WebViews, target _blank often fails. We prevent default and force navigation
+    e.preventDefault();
+    if (downloadUrl) {
+      // First try to hint download logic
+      const a = document.createElement('a');
+      a.href = downloadUrl;
+      a.download = "video.mp4";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      
+      // Strict webview fallback
+      setTimeout(() => {
+        window.location.href = downloadUrl;
+      }, 500);
     }
   };
 
@@ -275,8 +344,7 @@ export default function App() {
                   <div className="pt-2">
                     <a
                       href={downloadUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                      onClick={handleDownloadClick}
                       className="inline-flex items-center justify-center gap-2 px-8 py-4 bg-zinc-900 hover:bg-black text-white font-semibold rounded-full transition-all text-sm shadow-md hover:shadow-lg hover:-translate-y-0.5"
                     >
                       <Download className="w-4 h-4" />
